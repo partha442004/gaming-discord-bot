@@ -1,10 +1,12 @@
 services:
   - type: web
-    name: gaming-discord-bot
+    name: gaming-telegram-bot
     runtime: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: DISCORD_TOKEN
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
         sync: false

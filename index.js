@@ -1,47 +1,75 @@
-import {
-  Client,
-  GatewayIntentBits,
-  ActivityType,
-  EmbedBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  ActionRowBuilder,
-  Events,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-} from "discord.js";
+import TelegramBot from "node-telegram-bot-api";
 import { createServer } from "node:http";
+import pg from "pg";
 
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const GUILD_ID = process.env.GUILD_ID || "";
-const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || "";
-const WELCOME_ROLE_ID = process.env.WELCOME_ROLE_ID || "";
+const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const MC_ADDRESS = process.env.MC_ADDRESS || "";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
-if (!DISCORD_TOKEN) {
-  console.error("FATAL: DISCORD_TOKEN is not set. Add it in the service Variables tab, then redeploy.");
+if (!TOKEN) {
+  console.error("FATAL: TELEGRAM_BOT_TOKEN is not set. Get one from @BotFather, then add it in the service Variables tab and redeploy.");
   process.exit(1);
 }
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-  ],
-});
+const bot = new TelegramBot(TOKEN, { polling: true });
 
-// Maps button customId -> role name users toggle.
-const ROLE_MENU = {
-  role_mc: "Minecraft",
-  role_val: "Valorant",
-  role_fortnite: "Fortnite",
-  role_lol: "League of Legends",
-};
+const GAMES = [
+  { id: "mc", label: "Minecraft", emoji: "⛏️" },
+  { id: "val", label: "Valorant", emoji: "🎯" },
+  { id: "fortnite", label: "Fortnite", emoji: "🎨" },
+  { id: "lol", label: "League of Legends", emoji: "⚔️" },
+];
+
+const GAME_BY_ID = Object.fromEntries(GAMES.map((g) => [g.id, g]));
+
+// ---------- Optional persistence to Neon Postgres ----------
+
+let pool = null;
+if (DATABASE_URL) {
+  pool = new pg.Pool({ connectionString: DATABASE_URL });
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_games (
+        user_id BIGINT PRIMARY KEY,
+        games TEXT[] NOT NULL DEFAULT '{}',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    console.log("✅ Postgres ready (user_games table)");
+  } catch (err) {
+    console.error("Postgres init failed (falling back to in-memory):", err.message);
+    pool = null;
+  }
+}
+
+const memoryStore = new Map();
+
+async function getGames(userId) {
+  if (pool) {
+    const { rows } = await pool.query("SELECT games FROM user_games WHERE user_id = $1", [userId]);
+    return rows[0]?.games ?? [];
+  }
+  return memoryStore.get(userId) ?? [];
+}
+
+async function setGames(userId, games) {
+  if (pool) {
+    await pool.query(
+      "INSERT INTO user_games (user_id, games, updated_at) VALUES ($1, $2, now()) ON CONFLICT (user_id) DO UPDATE SET games = $2, updated_at = now()",
+      [userId, games]
+    );
+  } else {
+    memoryStore.set(userId, games);
+  }
+}
 
 // ---------- Minecraft status (free api, https://mcsrvstat.us) ----------
+
+function cleanMotd(motd) {
+  if (!motd) return "";
+  const line = Array.isArray(motd.clean) ? motd.clean.join("\n") : String(motd.clean || "");
+  return line.replace(/[&§][0-9a-fk-or]/gi, "").trim();
+}
 
 async function getMcStatus(address) {
   const addr = String(address || "").trim();
@@ -60,205 +88,163 @@ async function getMcStatus(address) {
     version: data.version || "Unknown",
     players: { online: data.players?.online ?? 0, max: data.players?.max ?? 0 },
     motd: cleanMotd(data.motd),
-    icon: data.icon ?? null,
   };
 }
 
-function cleanMotd(motd) {
-  if (!motd) return "";
-  const line = Array.isArray(motd.clean) ? motd.clean.join("\n") : String(motd.clean || "");
-  return line.replace(/[&§][0-9a-fk-or]/gi, "").trim();
-}
-
-function statusEmbed(info) {
-  const e = new EmbedBuilder()
-    .setTitle("🟢 Minecraft Server Status")
-    .setDescription(info.motd || info.hostname || info.address)
-    .setColor(info.online ? 0x22c55e : 0xef4444);
-  if (info.note) e.setDescription(info.note);
-  e.addFields(
-    { name: "Address", value: `\`${info.address || "none"}\``, inline: true },
-    { name: "Status", value: info.online ? "🟢 Online" : "🔴 Offline", inline: true }
-  );
-  if (info.online) {
-    e.addFields(
-      { name: "Version", value: info.version, inline: true },
-      { name: "Players", value: `${info.players.online}/${info.players.max}`, inline: true }
-    );
-  }
-  if (info.icon) {
-    try {
-      e.setThumbnail(`data:image/png;base64,${info.icon}`);
-    } catch {
-      /* ignore malformed icon */
-    }
-  }
-  e.setFooter({ text: "Data from mcsrvstat.us" });
-  return e;
-}
-
-function welcomeEmbed(member) {
-  return new EmbedBuilder()
-    .setTitle(`🎮 Welcome to the guild, ${member.displayName}!`)
-    .setColor(0x5865f2)
-    .setDescription(
-      "Glad you're here!\nUse the buttons below to add roles for the games you play so you get the right pings."
-    );
-}
-
-function roleMenuRow() {
-  const styles = {
-    role_mc: ButtonStyle.Success,
-    role_val: ButtonStyle.Primary,
-    role_fortnite: ButtonStyle.Danger,
-    role_lol: ButtonStyle.Secondary,
-  };
-  return new ActionRowBuilder().addComponents(
-    Object.entries(ROLE_MENU).map(([id, label]) =>
-      new ButtonBuilder().setCustomId(id).setLabel(label).setStyle(styles[id] ?? ButtonStyle.Primary)
-    )
-  );
-}
-
-// ---------- Ready ----------
-
-client.once(Events.ClientReady, async () => {
-  console.log(`✅ Logged in as ${client.user.tag} (${client.user.id})`);
-  client.user.setPresence({
-    activities: [
-      {
-        name: MC_ADDRESS ? `Minecraft ${MC_ADDRESS}` : "the gaming server",
-        type: ActivityType.Playing,
-      },
-    ],
-  });
-
-  const commands = [
-    new SlashCommandBuilder()
-      .setName("mcstatus")
-      .setDescription("Check the Minecraft server status")
-      .addStringOption((o) => o.setName("address").setDescription("Override server address").setRequired(false)),
-    new SlashCommandBuilder()
-      .setName("roll")
-      .setDescription("Roll a die")
-      .addIntegerOption((o) => o.setName("sides").setDescription("Number of sides (default 6)").setRequired(false)),
-    new SlashCommandBuilder().setName("ping").setDescription("Bot latency"),
-    new SlashCommandBuilder().setName("invite").setDescription("Get the bot invite link"),
+function mcStatusText(info) {
+  if (info.note) return `🔴 ${info.note}`;
+  const lines = [
+    info.online ? "🟢 **Minecraft Server is ONLINE**" : "🔴 **Minecraft Server is OFFLINE**",
+    "",
+    `🏷️ **Address:** \`${info.address || "none"}\``,
+    `📡 **Status:** ${info.online ? "Online" : "Offline"}`,
   ];
+  if (info.online) {
+    lines.push(
+      `🕹️ **Version:** ${info.version}`,
+      `👥 **Players:** ${info.players.online}/${info.players.max}`
+    );
+  }
+  if (info.motd) lines.splice(2, 0, `💬 **MOTD:** ${info.motd}`);
+  lines.push("", "_Data from mcsrvstat.us_");
+  return lines.join("\n");
+}
 
-  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+// ---------- Helpers ----------
+
+function gameKeyboard(userId) {
+  const rows = [];
+  for (let i = 0; i < GAMES.length; i += 2) {
+    const pair = GAMES.slice(i, i + 2);
+    rows.push(
+      pair.map((g) => ({
+        text: `${g.emoji} ${g.label}`,
+        callback_data: `toggle_${g.id}`,
+      }))
+    );
+  }
+  return { inline_keyboard: rows };
+}
+
+async function welcomeMessage(chatId) {
+  const games = await getGames(chatId);
+  const list =
+    games.length > 0
+      ? games.map((id) => GAME_BY_ID[id]?.emoji + " " + GAME_BY_ID[id]?.label).join("\n")
+      : "_None selected yet._";
+  return (
+    "🎮 **Welcome to the gaming hub!**\n\n" +
+    "Tap the buttons below to pick the games you play so you get the right pings.\n\n" +
+    `**Your games:**\n${list}\n\n` +
+    "Commands: `/mcstatus`, `/roll`, `/ping`, `/help`"
+  );
+}
+
+// ---------- Commands ----------
+
+bot.onText(/^\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  await bot.sendMessage(chatId, await welcomeMessage(chatId), {
+    parse_mode: "Markdown",
+    reply_markup: gameKeyboard(chatId),
+  });
+});
+
+bot.onText(/^\/help/, async (msg) => {
+  await bot.sendMessage(
+    msg.chat.id,
+    "🎮 **Gaming bot commands**\n\n" +
+      "`/start` - show the game role menu\n" +
+      "`/mcstatus [address]` - check Minecraft server status\n" +
+      "`/roll [sides]` - roll a die (default 6)\n" +
+      "`/ping` - bot latency\n\n" +
+      "Use the buttons in /start to select your games.",
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.onText(/^\/mcstatus(?:\s+(.+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const address = (match?.[1] || "").trim() || MC_ADDRESS;
+  const sent = await bot.sendMessage(chatId, "🔎 Checking Minecraft server status…");
   try {
-    if (GUILD_ID) {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
-      console.log("✅ Registered guild commands");
-    } else {
-      await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-      console.log("✅ Registered global commands");
-    }
+    const info = await getMcStatus(address);
+    await bot.editMessageText(mcStatusText(info), {
+      chat_id: chatId,
+      message_id: sent.message_id,
+      parse_mode: "Markdown",
+    });
   } catch (err) {
-    console.error("Command registration failed:", err.message);
+    await bot.editMessageText(`⚠️ Couldn't reach the status API: ${err.message}`, {
+      chat_id: chatId,
+      message_id: sent.message_id,
+    });
   }
 });
 
-// ---------- Welcome / auto-role ----------
-
-client.on(Events.GuildMemberAdd, async (member) => {
-  console.log(`👋 ${member.user.tag} joined ${member.guild.name}`);
-  if (WELCOME_ROLE_ID) {
-    try {
-      await member.roles.add(WELCOME_ROLE_ID);
-      console.log(`Auto-assigned welcome role to ${member.displayName}`);
-    } catch (err) {
-      console.error("Auto-role failed:", err.message);
-    }
-  }
-  const channel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-  if (channel?.isTextBased()) {
-    await channel.send({ content: `Welcome, <@${member.id}>! 👋`, embeds: [welcomeEmbed(member)], components: [roleMenuRow()] });
-  }
+bot.onText(/^\/roll(?:\s+(\d+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const sides = Math.min(1000, Number(match?.[1]) || 6);
+  const value = 1 + Math.floor(Math.random() * sides);
+  await bot.sendMessage(chatId, `🎲 Rolled **${value}** (1–${sides})`, { parse_mode: "Markdown" });
 });
 
-// ---------- Interactions ----------
+bot.onText(/^\/ping/, async (msg) => {
+  const chatId = msg.chat.id;
+  const before = Date.now();
+  const sent = await bot.sendMessage(chatId, "🏓 Pong!");
+  const latency = Date.now() - before;
+  await bot.editMessageText(`🏓 Pong! Latency: **${latency}ms**`, {
+    chat_id: chatId,
+    message_id: sent.message_id,
+    parse_mode: "Markdown",
+  });
+});
 
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.inCachedGuild()) return;
+// ---------- Game toggle buttons ----------
 
-  if (interaction.isChatInputCommand()) {
-    switch (interaction.commandName) {
-      case "mcstatus": {
-        await interaction.deferReply({});
-        const address = interaction.options.getString("address") || MC_ADDRESS;
-        try {
-          const info = await getMcStatus(address);
-          await interaction.editReply({ embeds: [statusEmbed(info)] });
-        } catch (err) {
-          await interaction.editReply(`⚠️ Couldn't reach the status API: ${err.message}`);
-        }
-        return;
-      }
-      case "roll": {
-        const sides = Math.min(1000, interaction.options.getInteger("sides") ?? 6);
-        await interaction.reply(`🎲 Rolled **${1 + Math.floor(Math.random() * sides)}** (1–${sides})`);
-        return;
-      }
-      case "ping":
-        await interaction.reply(`🏓 Pong! Latency: **${client.ws.ping}ms**`);
-        return;
-      case "invite":
-        await interaction.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle("Invite this bot")
-              .setURL(`https://discord.com/oauth2/authorize?client_id=${client.user.id}&scope=bot&permissions=8`)
-              .setDescription("Click the title to add this bot to a server."),
-          ],
-        });
-        return;
-      default:
-        await interaction.reply("Unknown command.");
-    }
+bot.on("callback_query", async (query) => {
+  const data = query.data || "";
+  if (!data.startsWith("toggle_")) {
+    await bot.answerCallbackQuery(query.id);
     return;
   }
+  const gameId = data.slice("toggle_".length);
+  if (!GAME_BY_ID[gameId]) {
+    await bot.answerCallbackQuery(query.id, { text: "Unknown game" });
+    return;
+  }
+  const userId = query.from.id;
+  const current = await getGames(userId);
+  const has = current.includes(gameId);
+  const next = has ? current.filter((g) => g !== gameId) : [...current, gameId];
+  await setGames(userId, next);
 
-  if (interaction.isButton()) {
-    const roleName = ROLE_MENU[interaction.customId];
-    if (!roleName) {
-      await interaction.reply({ content: "Unknown button.", ephemeral: true });
-      return;
-    }
-    const role = interaction.guild.roles.cache.find((r) => r.name.toLowerCase() === roleName.toLowerCase());
-    if (!role) {
-      await interaction.reply({
-        content: `Role **"${roleName}"** doesn't exist yet. Create it in **Server Settings → Roles** with that exact name.`,
-        ephemeral: true,
-      });
-      return;
-    }
-    const has = interaction.member.roles.cache.has(role.id);
-    try {
-      if (has) {
-        await interaction.member.roles.remove(role);
-        await interaction.reply({ content: `Removed **${role.name}**.`, ephemeral: true });
-      } else {
-        await interaction.member.roles.add(role);
-        await interaction.reply({ content: `Added **${role.name}**!`, ephemeral: true });
-      }
-    } catch (err) {
-      await interaction.reply({ content: `Couldn't update roles: ${err.message}`, ephemeral: true });
-    }
+  const game = GAME_BY_ID[gameId];
+  await bot.answerCallbackQuery(query.id, {
+    text: `${game.emoji} ${game.label} ${has ? "removed" : "added"}`,
+  });
+
+  if (query.message?.chat?.id) {
+    await bot.editMessageText(await welcomeMessage(userId), {
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      parse_mode: "Markdown",
+      reply_markup: gameKeyboard(userId),
+    });
   }
 });
 
-client.login(DISCORD_TOKEN);
+bot.on("error", (err) => console.error("Bot error:", err.message));
 
-// Lightweight health/keepalive server so free-tier hosts (Render, Koyeb, etc.)
-// can ping the URL to keep the service from going idle. No extra dependencies.
+// ---------- Health/keepalive server (free-tier hosts) ----------
+
 const PORT = Number(process.env.PORT) || 3000;
 createServer((req, res) => {
   const hit = new Date().toISOString();
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "text/plain" });
-    res.end(`ok ${client.user?.tag ?? "starting"} ${hit}`);
+    res.end(`ok ${hit}`);
     return;
   }
   res.writeHead(200, { "content-type": "text/html" });
@@ -266,3 +252,5 @@ createServer((req, res) => {
 }).listen(PORT, () => {
   console.log(`🩺 Health server listening on :${PORT}`);
 });
+
+console.log("🤖 Telegram bot started (polling mode)");
