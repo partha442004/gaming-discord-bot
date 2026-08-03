@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: gaming-discord-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
